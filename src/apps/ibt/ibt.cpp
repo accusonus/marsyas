@@ -33,7 +33,6 @@
 #include <sstream>
 #include <iomanip>
 #include <AudioFile.h>
-#include <Eigen/Eigen>
 #include <filesystem>
 
 #include <marsyas/common_source.h>
@@ -1341,9 +1340,9 @@ ibt(mrs_string sfName, mrs_string outputTxt)
   const double sampleRate = static_cast<double>(inputFile.getSampleRate());
   const auto numSamples = inputFile.samples[0].size();
   double* inputSignal = inputFile.samples[0].data();
-  const int windowSize = int(0.1*sampleRate);
-  Eigen::Map<Eigen::ArrayXd> input(inputSignal, numSamples);
-
+  const int windowSize = 4096;
+  cout << windowSize << endl;
+  int cnt = 0;
   while (!inputTxt.eof())
   {
       string line;
@@ -1354,10 +1353,15 @@ ibt(mrs_string sfName, mrs_string outputTxt)
       {
           auto leftMargin = (sampleIndex - windowSize < 0) ? 0 : sampleIndex-windowSize;
           auto rightMargin = (sampleIndex + windowSize > int(numSamples)) ? int(numSamples) : sampleIndex + windowSize;
-          // Evaluate energy as (2/N)*sum(x^2) 
-          double energy = (input.segment(leftMargin, rightMargin)*input.segment(leftMargin, rightMargin)).sum();
-          energy /= (2.0 * windowSize);
-          cout << "Energy: " << energy << endl;
+          // Evaluate energy as (1/N)*sum(x^2) 
+          double energy = 0;
+          int numSteps = rightMargin - leftMargin;
+          double coef = 1 / (1.0 * numSteps);
+          for (int i = leftMargin; i < rightMargin; i++) {
+              energy += inputSignal[i]*inputSignal[i];
+          }
+          energy *= coef;
+          cout << cnt << " " << energy << endl;
           energyOutputTxt << energy << endl;
       }
   }
