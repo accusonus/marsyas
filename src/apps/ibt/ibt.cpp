@@ -34,6 +34,7 @@
 #include <iomanip>
 #include <AudioFile.h>
 #include <Eigen/Eigen>
+#include <filesystem>
 
 #include <marsyas/common_source.h>
 #include <marsyas/CommandLineOptions.h>
@@ -1301,17 +1302,46 @@ ibt(mrs_string sfName, mrs_string outputTxt)
   delete audioflow;
 
   // Start Marker reordering based on energy content
+
+  // First set up the input / output paths for our txt files
   ifstream inputTxt;
   ofstream energyOutputTxt;
-  inputTxt.open("C:\\Users\\SpyrosSiannas\\AppData\\Roaming\\accusonus\\BeatMarker\\asd_130.txt", ios::in);
-  energyOutputTxt.open("C:\\Users\\SpyrosSiannas\\AppData\\Roaming\\accusonus\\BeatMarker\\asd_130_power.txt");
-  cout << outputTxt << endl;
+  string txtOutPath, txtInPath;
+  string seperator;
+#ifdef WIN32
+  seperator = "\\";
+#else 
+  seperator = "/";
+#endif
+  // Works on both platforms
+  size_t found = sfName.find_last_of("/\\");
+  string filePath = sfName.substr(0, found);
+  string filename = sfName.substr(found + 1);
+  found = filename.find_last_of(".");
+  filename = filename.substr(0, found);
+  string currentPath = filesystem::current_path().string();
+
+  // Check if output path is given
+  if (!outputTxt.empty())
+  {
+      txtOutPath = outputTxt;
+      txtInPath = txtOutPath + seperator + filename + ".txt";
+      txtOutPath += seperator + filename + "_power.txt";
+  }
+  else
+  {
+      txtOutPath = currentPath + seperator + filename + "_power.txt";
+      txtInPath = currentPath + seperator + filename + ".txt";
+  }
+
+  inputTxt.open(txtInPath, ios::in);
+  energyOutputTxt.open(txtOutPath);
   // load Audiofile
   inputFile.load(sfName);
   const double sampleRate = static_cast<double>(inputFile.getSampleRate());
   const auto numSamples = inputFile.samples[0].size();
   double* inputSignal = inputFile.samples[0].data();
-  const int windowSize = int(0.5*sampleRate);
+  const int windowSize = int(0.1*sampleRate);
   Eigen::Map<Eigen::ArrayXd> input(inputSignal, numSamples);
 
   while (!inputTxt.eof())
@@ -1320,12 +1350,13 @@ ibt(mrs_string sfName, mrs_string outputTxt)
       getline(inputTxt, line);
       double timeSec = strtod(line.c_str(), NULL);
       int sampleIndex = int(timeSec * sampleRate);
-      if (timeSec != 0) {
+      if (timeSec != 0)
+      {
           auto leftMargin = (sampleIndex - windowSize < 0) ? 0 : sampleIndex-windowSize;
           auto rightMargin = (sampleIndex + windowSize > int(numSamples)) ? int(numSamples) : sampleIndex + windowSize;
           // Evaluate energy as (2/N)*sum(x^2) 
           double energy = (input.segment(leftMargin, rightMargin)*input.segment(leftMargin, rightMargin)).sum();
-          input.segment(leftMargin, rightMargin) = 0;
+          energy /= (2.0 * windowSize);
           cout << "Energy: " << energy << endl;
           energyOutputTxt << energy << endl;
       }
