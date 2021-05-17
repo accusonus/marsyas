@@ -30,7 +30,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <sstream>
 #include <iomanip>
+#include <AudioFile.h>
+#include <Eigen/Eigen>
 
 #include <marsyas/common_source.h>
 #include <marsyas/CommandLineOptions.h>
@@ -129,6 +132,7 @@ mrs_real phase_;
 mrs_natural minBPM_;
 mrs_natural maxBPM_;
 mrs_real sup_thres;
+AudioFile<double> inputFile;
 
 int
 printUsage(string progName)
@@ -1295,6 +1299,37 @@ ibt(mrs_string sfName, mrs_string outputTxt)
     frameCount++;
   }
   delete audioflow;
+
+  // Start Marker reordering based on energy content
+  ifstream inputTxt;
+  ofstream energyOutputTxt;
+  inputTxt.open("C:\\Users\\SpyrosSiannas\\AppData\\Roaming\\accusonus\\BeatMarker\\asd_130.txt", ios::in);
+  energyOutputTxt.open("C:\\Users\\SpyrosSiannas\\AppData\\Roaming\\accusonus\\BeatMarker\\asd_130_power.txt");
+  cout << outputTxt << endl;
+  // load Audiofile
+  inputFile.load(sfName);
+  const double sampleRate = static_cast<double>(inputFile.getSampleRate());
+  const auto numSamples = inputFile.samples[0].size();
+  double* inputSignal = inputFile.samples[0].data();
+  const int windowSize = int(0.5*sampleRate);
+  Eigen::Map<Eigen::ArrayXd> input(inputSignal, numSamples);
+
+  while (!inputTxt.eof())
+  {
+      string line;
+      getline(inputTxt, line);
+      double timeSec = strtod(line.c_str(), NULL);
+      int sampleIndex = int(timeSec * sampleRate);
+      if (timeSec != 0) {
+          auto leftMargin = (sampleIndex - windowSize < 0) ? 0 : sampleIndex-windowSize;
+          auto rightMargin = (sampleIndex + windowSize > int(numSamples)) ? int(numSamples) : sampleIndex + windowSize;
+          // Evaluate energy as (2/N)*sum(x^2) 
+          double energy = (input.segment(leftMargin, rightMargin)*input.segment(leftMargin, rightMargin)).sum();
+          input.segment(leftMargin, rightMargin) = 0;
+          cout << "Energy: " << energy << endl;
+          energyOutputTxt << energy << endl;
+      }
+  }
   cout << "Finish!" << endl;
 }
 
