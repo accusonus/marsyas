@@ -1340,7 +1340,7 @@ ibt(mrs_string sfName, mrs_string outputTxt)
   const double sampleRate = static_cast<double>(inputFile.getSampleRate());
   const auto numSamples = inputFile.samples[0].size();
   double* inputSignal = inputFile.samples[0].data();
-  const int windowSize = 4096;
+  const int windowSize = 0.1*sampleRate;
   cout << windowSize << endl;
   int cnt = 0;
   while (!inputTxt.eof())
@@ -1348,6 +1348,7 @@ ibt(mrs_string sfName, mrs_string outputTxt)
       string line;
       getline(inputTxt, line);
       double timeSec = strtod(line.c_str(), NULL);
+      timeSec = round(timeSec * 1000.0) / 1000.0;
       int sampleIndex = int(timeSec * sampleRate);
       if (timeSec != 0)
       {
