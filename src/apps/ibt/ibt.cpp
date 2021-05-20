@@ -30,7 +30,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <sstream>
 #include <iomanip>
+#include <AudioFile.h>
+#include <filesystem>
 
 #include <marsyas/common_source.h>
 #include <marsyas/CommandLineOptions.h>
@@ -129,6 +132,7 @@ mrs_real phase_;
 mrs_natural minBPM_;
 mrs_natural maxBPM_;
 mrs_real sup_thres;
+AudioFile<double> inputFile;
 
 int
 printUsage(string progName)
@@ -1295,6 +1299,71 @@ ibt(mrs_string sfName, mrs_string outputTxt)
     frameCount++;
   }
   delete audioflow;
+
+  // Start Marker reordering based on energy content
+
+  // First set up the input / output paths for our txt files
+  ifstream inputTxt;
+  ofstream energyOutputTxt;
+  string txtOutPath, txtInPath;
+  string seperator;
+#ifdef WIN32
+  seperator = "\\";
+#else 
+  seperator = "/";
+#endif
+  // Works on both platforms
+  size_t found = sfName.find_last_of("/\\");
+  string filePath = sfName.substr(0, found);
+  string filename = sfName.substr(found + 1);
+  found = filename.find_last_of(".");
+  filename = filename.substr(0, found);
+  string currentPath = filesystem::current_path().string();
+
+  // Check if output path is given
+  if (!outputTxt.empty())
+  {
+      txtOutPath = outputTxt;
+      txtInPath = txtOutPath + seperator + filename + ".txt";
+      txtOutPath += seperator + filename + "_power.txt";
+  }
+  else
+  {
+      txtOutPath = currentPath + seperator + filename + "_power.txt";
+      txtInPath = currentPath + seperator + filename + ".txt";
+  }
+
+  inputTxt.open(txtInPath, ios::in);
+  energyOutputTxt.open(txtOutPath);
+  // load Audiofile
+  inputFile.load(sfName);
+  const double sampleRate = static_cast<double>(inputFile.getSampleRate());
+  const auto numSamples = inputFile.samples[0].size();
+  double* inputSignal = inputFile.samples[0].data();
+  const int windowSize = 0.1*sampleRate;
+  int cnt = 0;
+  while (!inputTxt.eof())
+  {
+      string line;
+      getline(inputTxt, line);
+      double timeSec = strtod(line.c_str(), NULL);
+      timeSec = round(timeSec * 1000.0) / 1000.0;
+      int sampleIndex = int(timeSec * sampleRate);
+      if (timeSec != 0)
+      {
+          auto leftMargin = (sampleIndex - windowSize < 0) ? 0 : sampleIndex-windowSize;
+          auto rightMargin = (sampleIndex + windowSize > int(numSamples)) ? int(numSamples) : sampleIndex + windowSize;
+          // Evaluate energy as (1/N)*sum(x^2) 
+          double energy = 0;
+          int numSteps = rightMargin - leftMargin;
+          double coef = 1 / (1.0 * numSteps);
+          for (int i = leftMargin; i < rightMargin; i++) {
+              energy += inputSignal[i]*inputSignal[i];
+          }
+          energy *= coef;
+          energyOutputTxt << energy << endl;
+      }
+  }
   cout << "Finish!" << endl;
 }
 

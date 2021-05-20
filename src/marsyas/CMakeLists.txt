@@ -296,6 +296,7 @@ endif(MARSYAS_GSTREAMER)
 ## INSTALL
 
 install( FILES
+
   basis.h
   Collection.h
   Color.h

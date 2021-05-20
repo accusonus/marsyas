@@ -19,9 +19,9 @@ mark_as_advanced(DSOUND_INCLUDE_DIR)
 find_library(DSOUND_LIBRARY dsound
   PATHS
     "$ENV{DXSDK_DIR}/Lib/x86"
-    "$ENV{PROGRAMFILES}/Microsoft DirectX SDK/Lib/x86"
-    "$ENV{PROGRAMFILES}/Microsoft DirectX SDK (August 2008)/Lib/x86"
-    "$ENV{PROGRAMFILES}/Microsoft DirectX SDK (June 2010)/Lib/x86"
+    "$ENV{PROGRAMFILES}/Microsoft DirectX SDK/Lib/x64"
+    "$ENV{PROGRAMFILES}/Microsoft DirectX SDK (August 2008)/Lib/x64"
+    "$ENV{PROGRAMFILES}/Microsoft DirectX SDK (June 2010)/Lib/x64"
   DOC "The directory where the dsound library resides"
 )
 mark_as_advanced(DSOUND_LIBRARY)
