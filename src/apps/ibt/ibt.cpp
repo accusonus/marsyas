@@ -29,10 +29,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <string>
 #include <sstream>
 #include <iomanip>
 #include <AudioFile.h>
+#include <Eigen/Eigen>
+#include <iterator>
 #include <filesystem>
 
 #include <marsyas/common_source.h>
@@ -63,8 +66,8 @@ using namespace Marsyas;
 #pragma warning(disable: 4100) //disable argc warning
 #endif
 
-//mrs_bool sonicOutFlux = 0;
-//mrs_bool sonicOutFluxFilter = 0;
+mrs_bool sonicOutFlux = 0;
+mrs_bool sonicOutFluxFilter = 0;
 
 //============================== IBT FUNCTIONAL PARAMETERS ==============================
 
@@ -381,6 +384,140 @@ readGTBeatsFile(MarSystem* beattracker, mrs_string gtBeatsFile, mrs_string audio
 }
 
 void
+findOnsets(double *inputSignal, size_t totalSamples, double samplerate, std::vector<double> &onsetList)
+{
+  /* Warning: All operations happen in place in the inputSignal buffer.
+              This function is intended to be used in a webassebly context.
+              It is important to minimise memory size and copies.
+  */
+
+  constexpr int windowSize = 4096;
+
+  // We operate only on windowSize multiples and discard the rest
+  const auto numSamples = int(totalSamples / double(windowSize)) * windowSize;
+  Eigen::Map<Eigen::ArrayXd> input (inputSignal, numSamples);
+  Eigen::ArrayXd energySlope (numSamples);
+  Eigen::ArrayXcd fftRes (numSamples / 2 + 1);
+  
+  // ======================
+  // Normalize
+  const double gain = 1.0 / input.abs().maxCoeff();
+  input *= gain; 
+
+  // ======================
+  // Calculate energy per block; uses Rectangular non-overlapping windows :D
+  for(int i = 0; i < numSamples; i += windowSize) { 
+    input.segment<windowSize>(i) = (input.segment<windowSize>(i) * input.segment<windowSize>(i)).sum() / double(windowSize); 
+  }
+
+  // ======================
+  // Get energy slope
+
+  // First block:
+  energySlope.head<windowSize>() = input.head<windowSize>();
+  // The rest:
+  energySlope.segment(windowSize, numSamples - windowSize) = input.segment(windowSize, numSamples - windowSize) - input.head(numSamples - windowSize);
+
+  // Note: We could assume silence after the signal to identify potential maxima
+  // at the last block(s), but we have already shown our indifference on that part by trimming
+  // the signal earlier. 
+
+  // ======================
+  // Find maxima
+
+  // arbitrary initial capacity
+  std::vector<double> onsetMap(2048);
+
+  bool isIncreasingWeakly = false;
+  int numMaxima = 0;
+  double averageMaximaEnergy = 0.0;
+  for(int i = 0; i < numSamples - windowSize; i += windowSize) { 
+    if (energySlope[i] > 0.0) {
+      isIncreasingWeakly = true;
+    }
+    else if(energySlope[i] < 0.0) {
+      isIncreasingWeakly = false;
+    }
+
+    if (isIncreasingWeakly && energySlope[i + windowSize] < 0.0) {
+      energySlope.segment<windowSize>(i) = 1.0;
+      numMaxima++;
+      averageMaximaEnergy += input[i];
+      onsetList.push_back(i / samplerate); 
+    }
+    else {
+      energySlope.segment<windowSize>(i) = 0.0;
+    }
+  }
+  // Ignores maximum in last block if it exists
+  energySlope.tail<windowSize>() = 0.0;
+
+  std::cout << "Total maxima: " << numMaxima << std::endl;
+  std::cout << "Average maxima energy: " << averageMaximaEnergy / numMaxima << std::endl;
+}
+
+double 
+getScoreAtSamplePosition(int sampleIndex, double* inputSignal, int numSamples, double samplerate)
+{
+  const int windowSize = 1.2 * samplerate;
+  // const double cosTheta = std::sqrt(2) / 2.0;
+  // const double sinTheta = std::sqrt(2) / 2.0;
+
+  const auto leftMargin = (sampleIndex - windowSize / 2 < 0) ? 0 : sampleIndex - windowSize / 2;
+  const auto leftOuterMargin = (sampleIndex - windowSize < 0) ? 0 : sampleIndex - windowSize;
+
+  const auto rightMargin = (sampleIndex + windowSize / 2 > int(numSamples)) ? int(numSamples) : sampleIndex + windowSize / 2;
+  const auto rightOuterMargin = (sampleIndex + windowSize > int(numSamples)) ? int(numSamples) : sampleIndex + windowSize;
+
+  const int numSamplesL = sampleIndex - leftMargin;
+  const int numSamplesR = rightMargin - sampleIndex;
+  const double coefL = 1.0 / numSamplesL;
+  const double coefR = 1.0 / numSamplesR;
+  double energyL = 0.0;
+  double energyR = 0.0;
+
+  const int numSamplesOuterL = leftMargin - leftOuterMargin;
+  const int numSamplesOuterR = rightOuterMargin - rightMargin;
+  const double coefOuterL = numSamplesOuterL > 0 ? 1.0 / numSamplesOuterL : 1.0;
+  const double coefOuterR = numSamplesOuterR > 0 ? 1.0 / numSamplesOuterR : 1.0;
+  double energyOuterL = 0.0;
+  double energyOuterR = 0.0;
+
+  // Evaluate energy for windows [leftMargin, sampleIndex) and
+  // [sampleIndex, rightMargin)
+  // as (1/N)*sum(x^2) 
+  for (int i = leftMargin; i < sampleIndex; i++) {
+      energyL += inputSignal[i] * inputSignal[i];
+  }
+  for (int i = sampleIndex; i < rightMargin; i++) {
+      energyR += inputSignal[i] * inputSignal[i];
+  }
+  energyL *= coefL;
+  energyR *= coefR;
+
+  for (int i = leftOuterMargin; i < leftMargin; i++) {
+      energyOuterL += inputSignal[i] * inputSignal[i];
+  }
+  for (int i = rightMargin; i < rightOuterMargin; i++) {
+      energyOuterR += inputSignal[i] * inputSignal[i];
+  }
+  energyOuterL *= coefOuterL;
+  energyOuterR *= coefOuterR;
+
+  // compute score function
+    // double y = 1.0 / (energyR - energyL);
+  // +Inf is fine
+  double y = (energyR - energyL); // / (energyR + energyL + energyOuterL + energyOuterR);
+  // rotating the ratio in the x, y plane
+  // allows for symmetry in score function arguments
+    // double score = 1.0 / y * sinTheta + y * cosTheta;
+  // escalation is as important as degradation
+    // score = std::abs(1.0 / score);
+  auto score = y;
+  return score;
+}
+
+void
 ibt(mrs_string sfName, mrs_string outputTxt)
 {
   MarSystemManager mng;
@@ -404,8 +541,8 @@ ibt(mrs_string sfName, mrs_string outputTxt)
   onsetdetectionfunction->addMarSystem(mng.create("PowerSpectrum", "pspk"));
   onsetdetectionfunction->addMarSystem(mng.create("Flux", "flux"));
 
-  //if(sonicOutFlux)
-  //	onsetdetectionfunction->addMarSystem(mng.create("SonicVisualiserSink", "sonicsink"));
+  // if(sonicOutFlux)
+  // 	onsetdetectionfunction->addMarSystem(mng.create("SonicVisualiserSink", "sonicsink"));
 
   beattracker->addMarSystem(onsetdetectionfunction);
   beattracker->addMarSystem(mng.create("ShiftInput", "acc"));
@@ -413,17 +550,18 @@ ibt(mrs_string sfName, mrs_string outputTxt)
   MarSystem* normfiltering = mng.create("Series", "normfiltering");
   normfiltering->addMarSystem(mng.create("Filter","filt1"));
 
-  //if(sonicOutFluxFilter)
-  //	normfiltering->addMarSystem(mng.create("SonicVisualiserSink", "sonicsinkfilt"));
+  // if(sonicOutFluxFilter)
+  // 	normfiltering->addMarSystem(mng.create("SonicVisualiserSink", "sonicsinkfilt"));
 
   normfiltering->addMarSystem(mng.create("Reverse","rev1"));
   normfiltering->addMarSystem(mng.create("Filter","filt2"));
   normfiltering->addMarSystem(mng.create("Reverse","rev2"));
 
-  //if(sonicOutFluxFilter)
-  //	normfiltering->addMarSystem(mng.create("SonicVisualiserSink", "sonicsinkfilt"));
+  // if(sonicOutFluxFilter)
+  // 	normfiltering->addMarSystem(mng.create("SonicVisualiserSink", "sonicsinkfilt"));
 
   beattracker->addMarSystem(normfiltering);
+
 
   MarSystem* tempoinduction = mng.create("FlowThru", "tempoinduction");
 
@@ -660,22 +798,22 @@ ibt(mrs_string sfName, mrs_string outputTxt)
 
 
   //Link SonicVisualiserSink parameters with the used ones:
-  /*
-  if(sonicOutFlux)
-  {
-  	beattracker->linkControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_natural/hopSize",
-  		"BeatReferee/br/mrs_natural/hopSize");
-  	beattracker->linkControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_real/srcFs",
-  		"FlowThru/tempoinduction/TempoHypotheses/tempohyp/mrs_real/srcFs");
-  }
-  if(sonicOutFluxFilter)
-  {
-  	beattracker->linkControl("Series/normfiltering/SonicVisualiserSink/sonicsinkfilt/mrs_natural/hopSize",
-  		"BeatReferee/br/mrs_natural/hopSize");
-  	beattracker->linkControl("Series/normfiltering/SonicVisualiserSink/sonicsinkfilt/mrs_real/srcFs",
-  		"FlowThru/tempoinduction/TempoHypotheses/tempohyp/mrs_real/srcFs");
-  }
-  */
+  
+  // if(sonicOutFlux)
+  // {
+  // 	beattracker->linkControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_natural/hopSize",
+  // 		"BeatReferee/br/mrs_natural/hopSize");
+  // 	beattracker->linkControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_real/srcFs",
+  // 		"FlowThru/tempoinduction/TempoHypotheses/tempohyp/mrs_real/srcFs");
+  // }
+  // if(sonicOutFluxFilter)
+  // {
+  // 	beattracker->linkControl("Series/normfiltering/SonicVisualiserSink/sonicsinkfilt/mrs_natural/hopSize",
+  // 		"BeatReferee/br/mrs_natural/hopSize");
+  // 	beattracker->linkControl("Series/normfiltering/SonicVisualiserSink/sonicsinkfilt/mrs_real/srcFs",
+  // 		"FlowThru/tempoinduction/TempoHypotheses/tempohyp/mrs_real/srcFs");
+  // }
+  
 
   //link beatdetected with noise ADSR -> for clicking when beat:
   if(audiofileopt || audioopt)
@@ -801,14 +939,14 @@ ibt(mrs_string sfName, mrs_string outputTxt)
   //link inputSize for knowing when musical piece finishes
   beattracker->linkControl("BeatTimesSink/sink/mrs_natural/soundFileSize",
                            "BeatReferee/br/mrs_natural/soundFileSize");
-  /*
-  if(sonicOutFluxFilter)
-  	beattracker->linkControl("Series/normfiltering/SonicVisualiserSink/sonicsinkfilt/mrs_natural/soundFileSize",
-  		"BeatTimesSink/sink/mrs_natural/soundFileSize");
-  if(sonicOutFlux)
-  	beattracker->linkControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_natural/soundFileSize",
-  		"BeatTimesSink/sink/mrs_natural/soundFileSize");
-  */
+  
+  // if(sonicOutFluxFilter)
+  // 	beattracker->linkControl("Series/normfiltering/SonicVisualiserSink/sonicsinkfilt/mrs_natural/soundFileSize",
+  // 		"BeatTimesSink/sink/mrs_natural/soundFileSize");
+  // if(sonicOutFlux)
+  // 	beattracker->linkControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_natural/soundFileSize",
+  // 		"BeatTimesSink/sink/mrs_natural/soundFileSize");
+  
   //link non-causal mode flag
   beattracker->linkControl("BeatTimesSink/sink/mrs_bool/nonCausal",
                            "BeatReferee/br/mrs_bool/nonCausal");
@@ -1095,23 +1233,23 @@ ibt(mrs_string sfName, mrs_string outputTxt)
 
 
   //SonicVisualiser Controls:
-  /*
-  if(sonicOutFlux)
-  {
-  	beattracker->updControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_string/mode", "frames");
-  	beattracker->updControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_string/destFileName", path.str() + "_onsetFunction.txt");
+  
+  // if(sonicOutFlux)
+  // {
+  // 	beattracker->updControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_string/mode", "frames");
+  // 	beattracker->updControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_string/destFileName", path.str() + "_onsetFunction.txt");
 
-  	//if(backtraceopt)
-  	//	beattracker->updControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_natural/offset", inductionTickCount);
-  	//else
-  	//	beattracker->updControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_natural/offset", 0);
-  }
-  if(sonicOutFluxFilter)
-  {
-  	beattracker->updControl("Series/normfiltering/SonicVisualiserSink/sonicsinkfilt/mrs_string/mode", "frames");
-  	beattracker->updControl("Series/normfiltering/SonicVisualiserSink/sonicsinkfilt/mrs_string/destFileName", path.str() + "_onsetFunctionFilt.txt");
-  }
-  */
+  // 	if(backtraceopt)
+  // 		beattracker->updControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_natural/offset", inductionTickCount);
+  // 	else
+  // 		beattracker->updControl("Series/onsetdetectionfunction/SonicVisualiserSink/sonicsink/mrs_natural/offset", 0);
+  // }
+  // if(sonicOutFluxFilter)
+  // {
+  // 	beattracker->updControl("Series/normfiltering/SonicVisualiserSink/sonicsinkfilt/mrs_string/mode", "frames");
+  // 	beattracker->updControl("Series/normfiltering/SonicVisualiserSink/sonicsinkfilt/mrs_string/destFileName", path.str() + "_onsetFunctionFilt.txt");
+  // }
+  
 
   //set audio/onset resynth balance and ADSR params for onset sound
   if(audiofileopt || audioopt)
@@ -1335,12 +1473,71 @@ ibt(mrs_string sfName, mrs_string outputTxt)
 
   inputTxt.open(txtInPath, ios::in);
   energyOutputTxt.open(txtOutPath);
+
   // load Audiofile
   inputFile.load(sfName);
   const double sampleRate = static_cast<double>(inputFile.getSampleRate());
   const auto numSamples = inputFile.samples[0].size();
   double* inputSignal = inputFile.samples[0].data();
-  const int windowSize = 0.1*sampleRate;
+
+  // Get onsets
+  std::vector<double> onsetList{};
+  findOnsets(inputSignal, numSamples, sampleRate, onsetList);
+  std::cout << "Onset List has: " << onsetList.size() << " items." << std::endl;
+
+  // Get a score for each onset
+  std::map<double, std::vector<double>> onsetMap{};
+  for(const auto onset : onsetList)
+  {
+    auto score = getScoreAtSamplePosition(onset * sampleRate, inputSignal, numSamples, sampleRate);
+    onsetMap[score].push_back(onset);
+  }
+
+  // Reverse the map ie. change keys to values
+  const auto onsetMapCopy = onsetMap;
+  std::map<double, double> onsetScoreFull{};
+  for (auto it = onsetMapCopy.begin(); it != onsetMapCopy.end(); ++it)
+  {
+    for (const auto onset : it->second)
+    {
+      onsetScoreFull[onset] = it->first;
+    }
+  }
+
+  for (auto it = onsetScoreFull.begin(); it != onsetScoreFull.end(); ++it)
+  {
+      std::cout << "(Full List) Onset at: " << it->first << " with score: " << it->second << std::endl;
+  }
+
+  // Keep the N most important onset groups
+  const int N = 40;
+  auto eraseUntil = onsetMap.end();
+  std::advance(eraseUntil, - N);
+  onsetMap.erase(onsetMap.begin(), eraseUntil);
+
+  // Reverse the map ie. change keys to values
+  std::map<double, double> onsetScore{};
+  for (auto it = onsetMap.begin(); it != onsetMap.end(); ++it)
+  {
+    for (const auto onset : it->second)
+    {
+      onsetScore[onset] = it->first;
+      std::cout << "Score: " << it->first << " for onset: " << onset << std::endl;
+    }
+  }
+
+  for (auto it = onsetScore.begin(); it != onsetScore.end(); ++it)
+  {
+      std::cout << "Onset at: " << it->first << " with score: " << it->second << std::endl;
+  }
+
+  // TODO: Get Beats
+  // TODO: Double time
+
+  // TODO: Merge Beats & Onsets
+
+  // TODO: Write to files
+
   int cnt = 0;
   while (!inputTxt.eof())
   {
@@ -1351,17 +1548,8 @@ ibt(mrs_string sfName, mrs_string outputTxt)
       int sampleIndex = int(timeSec * sampleRate);
       if (timeSec != 0)
       {
-          auto leftMargin = (sampleIndex - windowSize < 0) ? 0 : sampleIndex-windowSize;
-          auto rightMargin = (sampleIndex + windowSize > int(numSamples)) ? int(numSamples) : sampleIndex + windowSize;
-          // Evaluate energy as (1/N)*sum(x^2) 
-          double energy = 0;
-          int numSteps = rightMargin - leftMargin;
-          double coef = 1 / (1.0 * numSteps);
-          for (int i = leftMargin; i < rightMargin; i++) {
-              energy += inputSignal[i]*inputSignal[i];
-          }
-          energy *= coef;
-          energyOutputTxt << energy << endl;
+          auto score = getScoreAtSamplePosition(sampleIndex, inputSignal, numSamples, sampleRate);
+          energyOutputTxt << score << endl;
       }
   }
   cout << "Finish!" << endl;
