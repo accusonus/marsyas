@@ -137,6 +137,8 @@ mrs_natural maxBPM_;
 mrs_real sup_thres;
 AudioFile<double> inputFile;
 
+mrs_real thresholdopt = 0.0;
+
 int
 printUsage(string progName)
 {
@@ -384,137 +386,194 @@ readGTBeatsFile(MarSystem* beattracker, mrs_string gtBeatsFile, mrs_string audio
 }
 
 void
-findOnsets(double *inputSignal, size_t totalSamples, double samplerate, std::vector<double> &onsetList)
+detect_onsets(string sfName, string txtOnsetPath)
 {
-  /* Warning: All operations happen in place in the inputSignal buffer.
-              This function is intended to be used in a webassebly context.
-              It is important to minimise memory size and copies.
-  */
+  // cout << "toying with onsets" << endl;
+  MarSystemManager mng;
 
-  constexpr int windowSize = 4096;
+  // assemble the processing network
+  MarSystem* onsetnet = mng.create("Series", "onsetnet");
+  MarSystem* onsetaccum = mng.create("Accumulator", "onsetaccum");
+  MarSystem* onsetseries= mng.create("Series","onsetseries");
+  onsetseries->addMarSystem(mng.create("SoundFileSource", "src"));
+  onsetseries->addMarSystem(mng.create("Stereo2Mono", "src")); //replace by a "Monofier" MarSystem (to be created) [!]
+  //onsetseries->addMarSystem(mng.create("ShiftInput", "si"));
+  //onsetseries->addMarSystem(mng.create("Windowing", "win"));
+  MarSystem* onsetdetector = mng.create("FlowThru", "onsetdetector");
+  onsetdetector->addMarSystem(mng.create("ShiftInput", "si")); //<---
+  onsetdetector->addMarSystem(mng.create("Windowing", "win")); //<---
+  onsetdetector->addMarSystem(mng.create("Spectrum","spk"));
+  onsetdetector->addMarSystem(mng.create("PowerSpectrum", "pspk"));
+  onsetdetector->addMarSystem(mng.create("Flux", "flux"));
+  //onsetdetector->addMarSystem(mng.create("Memory","mem"));
+  onsetdetector->addMarSystem(mng.create("ShiftInput","sif"));
+  onsetdetector->addMarSystem(mng.create("Filter","filt1"));
+  onsetdetector->addMarSystem(mng.create("Reverse","rev1"));
+  onsetdetector->addMarSystem(mng.create("Filter","filt2"));
+  onsetdetector->addMarSystem(mng.create("Reverse","rev2"));
+  onsetdetector->addMarSystem(mng.create("PeakerOnset","peaker"));
+  onsetseries->addMarSystem(onsetdetector);
+  onsetaccum->addMarSystem(onsetseries);
+  onsetnet->addMarSystem(onsetaccum);
+  //onsetnet->addMarSystem(mng.create("ShiftOutput","so"));
 
-  // We operate only on windowSize multiples and discard the rest
-  const auto numSamples = int(totalSamples / double(windowSize)) * windowSize;
-  Eigen::Map<Eigen::ArrayXd> input (inputSignal, numSamples);
-  Eigen::ArrayXd energySlope (numSamples);
-  Eigen::ArrayXcd fftRes (numSamples / 2 + 1);
-  
-  // ======================
-  // Normalize
-  const double gain = 1.0 / input.abs().maxCoeff();
-  input *= gain; 
 
-  // ======================
-  // Calculate energy per block; uses Rectangular non-overlapping windows :D
-  for(int i = 0; i < numSamples; i += windowSize) { 
-    input.segment<windowSize>(i) = (input.segment<windowSize>(i) * input.segment<windowSize>(i)).sum() / double(windowSize); 
+  ///////////////////////////////////////////////////////////////////////////////////////
+  //link controls
+  ///////////////////////////////////////////////////////////////////////////////////////
+  onsetnet->linkControl("mrs_bool/hasData",
+                        "Accumulator/onsetaccum/Series/onsetseries/SoundFileSource/src/mrs_bool/hasData");
+  //onsetnet->linkControl("ShiftOutput/so/mrs_natural/Interpolation","mrs_natural/inSamples");
+  onsetnet->linkControl("Accumulator/onsetaccum/mrs_bool/flush",
+                        "Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/PeakerOnset/peaker/mrs_bool/onsetDetected");
+
+  //onsetnet->linkControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/Memory/mem/mrs_bool/reset",
+  //  "Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/PeakerOnset/peaker/mrs_bool/onsetDetected");
+
+  //link FILTERS coeffs
+  onsetnet->linkControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/Filter/filt2/mrs_realvec/ncoeffs",
+                        "Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/Filter/filt1/mrs_realvec/ncoeffs");
+  onsetnet->linkControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/Filter/filt2/mrs_realvec/dcoeffs",
+                        "Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/Filter/filt1/mrs_realvec/dcoeffs");
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  // update controls
+  ///////////////////////////////////////////////////////////////////////////////////////
+  FileName outputFile(sfName);
+  onsetnet->updControl("Accumulator/onsetaccum/Series/onsetseries/SoundFileSource/src/mrs_string/filename", sfName);
+
+  mrs_real fs = onsetnet->getctrl("mrs_real/osrate")->to<mrs_real>();
+
+  mrs_natural winSize = 2048;//2048;
+  mrs_natural hopSize = 512;//411;
+
+
+  // mrs_natural winSize = 4096;//2048;
+  // mrs_natural hopSize = 1024;//411;
+
+  mrs_natural lookAheadSamples = 6;
+  mrs_real thres = thresholdopt;
+
+  mrs_real textureWinMinLen = 0.050; //secs
+  mrs_natural minTimes = (mrs_natural) (textureWinMinLen*fs/hopSize); //12;//onsetWinSize+1;//15;
+  // cout << "MinTimes = " << minTimes << " (i.e. " << textureWinMinLen << " secs)" << endl;
+  mrs_real textureWinMaxLen = 60.000; //secs
+  mrs_natural maxTimes = (mrs_natural) (textureWinMaxLen*fs/hopSize);//1000; //whatever... just a big number for now...
+  // cout << "MaxTimes = " << maxTimes << " (i.e. " << textureWinMaxLen << " secs)" << endl;
+
+  // best result till now are using dB power Spectrum!
+  // FIXME: should fix PowerSpectrum (remove that ugly wrongdBonsets control) and use a Gain with factor of two instead.
+  onsetnet->updControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/PowerSpectrum/pspk/mrs_string/spectrumType",
+                       "wrongdBonsets");
+
+  onsetnet->updControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/Flux/flux/mrs_string/mode",
+                       "DixonDAFX06");
+
+  //configure zero-phase Butterworth filter of Flux time series (from J.P.Bello TASLP paper)
+  // Coefficients taken from MATLAB butter(2, 0.28)
+  realvec bcoeffs(1,3);
+  bcoeffs(0) = 0.1174;
+  bcoeffs(1) = 0.2347;
+  bcoeffs(2) = 0.1174;
+  onsetnet->updControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/Filter/filt1/mrs_realvec/ncoeffs",
+                       bcoeffs);
+  realvec acoeffs(1,3);
+  acoeffs(0) = 1.0;
+  acoeffs(1) = -0.8252;
+  acoeffs(2) = 0.2946;
+  onsetnet->updControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/Filter/filt1/mrs_realvec/dcoeffs",
+                       acoeffs);
+
+  onsetnet->updControl("mrs_natural/inSamples", hopSize);
+  onsetnet->updControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/ShiftInput/si/mrs_natural/winSize", winSize);
+
+  onsetnet->updControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/PeakerOnset/peaker/mrs_natural/lookAheadSamples", lookAheadSamples);
+  onsetnet->updControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/PeakerOnset/peaker/mrs_real/threshold", thres); //!!!
+
+  onsetnet->updControl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/ShiftInput/sif/mrs_natural/winSize", 4*lookAheadSamples+1);
+
+  mrs_natural winds = 1+lookAheadSamples+mrs_natural(ceil(mrs_real(winSize)/hopSize/2.0));
+  // cout << "timesToKeep = " << winds << endl;
+  onsetnet->updControl("Accumulator/onsetaccum/mrs_natural/timesToKeep", winds);
+  onsetnet->updControl("Accumulator/onsetaccum/mrs_string/mode","explicitFlush");
+  onsetnet->updControl("Accumulator/onsetaccum/mrs_natural/maxTimes", maxTimes);
+  onsetnet->updControl("Accumulator/onsetaccum/mrs_natural/minTimes", minTimes);
+
+  //MATLAB Engine inits
+  //used for toy_with_onsets.m
+  MATLAB_EVAL("clear;");
+  MATLAB_PUT(winSize, "winSize");
+  MATLAB_PUT(hopSize, "hopSize");
+  MATLAB_PUT(lookAheadSamples, "lookAheadSamples");
+  MATLAB_EVAL("srcAudio = [];");
+  MATLAB_EVAL("onsetAudio = [];");
+  MATLAB_EVAL("FluxTS = [];");
+  MATLAB_EVAL("segmentData = [];");
+  MATLAB_EVAL("onsetTS = [];");
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  //process input file (till EOF)
+  ///////////////////////////////////////////////////////////////////////////////////////
+  mrs_natural timestamps_samples = 0;
+  cout << "Sampling rate = " << fs << endl;
+
+  ofstream outFile;
+  outFile.open(txtOnsetPath.c_str(), ios::out);
+
+  while(onsetnet->getctrl("mrs_bool/hasData")->to<mrs_bool>())
+  {
+    onsetnet->tick();
+    timestamps_samples += onsetnet->getctrl("mrs_natural/onSamples")->to<mrs_natural>();
+
+    mrs_real confidence = onsetnet->getctrl("Accumulator/onsetaccum/Series/onsetseries/FlowThru/onsetdetector/PeakerOnset/peaker/mrs_real/confidence")->to<mrs_real>();
+
+    if (confidence > thresholdopt)
+    {
+      outFile << timestamps_samples / fs << "\t";
+      outFile << confidence << endl;
+    }
   }
 
-  // ======================
-  // Get energy slope
+  cout << "Done writing " << txtOnsetPath << endl;
+  outFile.close();
 
-  // First block:
-  energySlope.head<windowSize>() = input.head<windowSize>();
-  // The rest:
-  energySlope.segment(windowSize, numSamples - windowSize) = input.segment(windowSize, numSamples - windowSize) - input.head(numSamples - windowSize);
-
-  // Note: We could assume silence after the signal to identify potential maxima
-  // at the last block(s), but we have already shown our indifference on that part by trimming
-  // the signal earlier. 
-
-  // ======================
-  // Find maxima
-
-  // arbitrary initial capacity
-  std::vector<double> onsetMap(2048);
-
-  bool isIncreasingWeakly = false;
-  int numMaxima = 0;
-  double averageMaximaEnergy = 0.0;
-  for(int i = 0; i < numSamples - windowSize; i += windowSize) { 
-    if (energySlope[i] > 0.0) {
-      isIncreasingWeakly = true;
-    }
-    else if(energySlope[i] < 0.0) {
-      isIncreasingWeakly = false;
-    }
-
-    if (isIncreasingWeakly && energySlope[i + windowSize] < 0.0) {
-      energySlope.segment<windowSize>(i) = 1.0;
-      numMaxima++;
-      averageMaximaEnergy += input[i];
-      onsetList.push_back(i / samplerate); 
-    }
-    else {
-      energySlope.segment<windowSize>(i) = 0.0;
-    }
-  }
-  // Ignores maximum in last block if it exists
-  energySlope.tail<windowSize>() = 0.0;
-
-  std::cout << "Total maxima: " << numMaxima << std::endl;
-  std::cout << "Average maxima energy: " << averageMaximaEnergy / numMaxima << std::endl;
+  delete onsetnet;
 }
 
 double 
 getScoreAtSamplePosition(int sampleIndex, double* inputSignal, int numSamples, double samplerate)
 {
-  const int windowSize = 1.2 * samplerate;
-  // const double cosTheta = std::sqrt(2) / 2.0;
-  // const double sinTheta = std::sqrt(2) / 2.0;
+  const int windowSize = 0.05 * samplerate;
 
-  const auto leftMargin = (sampleIndex - windowSize / 2 < 0) ? 0 : sampleIndex - windowSize / 2;
+  const auto rightMargin = (sampleIndex + windowSize > int(numSamples)) ? int(numSamples) : sampleIndex + windowSize;
   const auto leftOuterMargin = (sampleIndex - windowSize < 0) ? 0 : sampleIndex - windowSize;
+  const auto rightOuterMargin = (rightMargin + windowSize > int(numSamples)) ? int(numSamples) : rightMargin + windowSize;
 
-  const auto rightMargin = (sampleIndex + windowSize / 2 > int(numSamples)) ? int(numSamples) : sampleIndex + windowSize / 2;
-  const auto rightOuterMargin = (sampleIndex + windowSize > int(numSamples)) ? int(numSamples) : sampleIndex + windowSize;
-
-  const int numSamplesL = sampleIndex - leftMargin;
-  const int numSamplesR = rightMargin - sampleIndex;
-  const double coefL = 1.0 / numSamplesL;
-  const double coefR = 1.0 / numSamplesR;
-  double energyL = 0.0;
   double energyR = 0.0;
-
-  const int numSamplesOuterL = leftMargin - leftOuterMargin;
-  const int numSamplesOuterR = rightOuterMargin - rightMargin;
-  const double coefOuterL = numSamplesOuterL > 0 ? 1.0 / numSamplesOuterL : 1.0;
-  const double coefOuterR = numSamplesOuterR > 0 ? 1.0 / numSamplesOuterR : 1.0;
   double energyOuterL = 0.0;
   double energyOuterR = 0.0;
 
-  // Evaluate energy for windows [leftMargin, sampleIndex) and
-  // [sampleIndex, rightMargin)
-  // as (1/N)*sum(x^2) 
-  for (int i = leftMargin; i < sampleIndex; i++) {
-      energyL += inputSignal[i] * inputSignal[i];
-  }
-  for (int i = sampleIndex; i < rightMargin; i++) {
-      energyR += inputSignal[i] * inputSignal[i];
-  }
-  energyL *= coefL;
-  energyR *= coefR;
+  double peakR = 0.0;
+  double peakOuterL = 0.0;
+  double peakOuterR = 0.0;
 
-  for (int i = leftOuterMargin; i < leftMargin; i++) {
+  for (int i = leftOuterMargin; i < sampleIndex; i++) {
+      peakOuterL = std::max(inputSignal[i] * inputSignal[i], peakOuterL);
       energyOuterL += inputSignal[i] * inputSignal[i];
   }
+  for (int i = sampleIndex; i < rightMargin; i++) {
+      peakR = std::max(inputSignal[i] * inputSignal[i], peakR);
+      energyR += inputSignal[i] * inputSignal[i];
+  }
   for (int i = rightMargin; i < rightOuterMargin; i++) {
+      peakOuterR = std::max(inputSignal[i] * inputSignal[i], peakOuterR);
       energyOuterR += inputSignal[i] * inputSignal[i];
   }
-  energyOuterL *= coefOuterL;
-  energyOuterR *= coefOuterR;
 
   // compute score function
-    // double y = 1.0 / (energyR - energyL);
-  // +Inf is fine
-  double y = (energyR - energyL); // / (energyR + energyL + energyOuterL + energyOuterR);
-  // rotating the ratio in the x, y plane
-  // allows for symmetry in score function arguments
-    // double score = 1.0 / y * sinTheta + y * cosTheta;
-  // escalation is as important as degradation
-    // score = std::abs(1.0 / score);
-  auto score = y;
-  return score;
+  // return std::max(peakR - peakOuterL, peakR - peakOuterR);
+  return std::max(energyR - energyOuterL, energyR - energyOuterR);
+  // return std::max(energyR - energyOuterL, 0.0);
 }
 
 void
@@ -1438,12 +1497,10 @@ ibt(mrs_string sfName, mrs_string outputTxt)
   }
   delete audioflow;
 
-  // Start Marker reordering based on energy content
-
   // First set up the input / output paths for our txt files
   ifstream inputTxt;
   ofstream energyOutputTxt;
-  string txtOutPath, txtInPath;
+  string txtOutPath, txtInPath, txtOnsetPath;
   string seperator;
 #ifdef WIN32
   seperator = "\\";
@@ -1461,14 +1518,15 @@ ibt(mrs_string sfName, mrs_string outputTxt)
   // Check if output path is given
   if (!outputTxt.empty())
   {
-      txtOutPath = outputTxt;
-      txtInPath = txtOutPath + seperator + filename + ".txt";
-      txtOutPath += seperator + filename + "_power.txt";
+      txtInPath = outputTxt + seperator + filename + ".txt";
+      txtOutPath = outputTxt + seperator + filename + "_power.txt";
+      txtOnsetPath = outputTxt + seperator + filename + "_onsets.txt";
   }
   else
   {
       txtOutPath = currentPath + seperator + filename + "_power.txt";
       txtInPath = currentPath + seperator + filename + ".txt";
+      txtOnsetPath = currentPath + seperator + filename + "_onsets.txt";
   }
 
   inputTxt.open(txtInPath, ios::in);
@@ -1480,20 +1538,40 @@ ibt(mrs_string sfName, mrs_string outputTxt)
   const auto numSamples = inputFile.samples[0].size();
   double* inputSignal = inputFile.samples[0].data();
 
-  // Get onsets
-  std::vector<double> onsetList{};
-  findOnsets(inputSignal, numSamples, sampleRate, onsetList);
-  std::cout << "Onset List has: " << onsetList.size() << " items." << std::endl;
+  // Find Onsets
 
-  // Get a score for each onset
+  // Code is borrowed from onsets.cpp
+  // You can find a strikingly similar mar(sub)system inside the `audioflow`
+  // marsystem created at the top of the `ibt` function.
+  //
+  // Couldn't make it work in a haste, but we are mostly interested in verifying
+  // any improvements in the quality of the results. Speed is not important at
+  // this point, we already exchange info with the `audioflow` marsystem through
+  // it's output files, so no shame.
+
+  // TODO: the whole `ibt` solution needs a good refactor, which will naturally absorb this absurdity.
+  detect_onsets(sfName, txtOnsetPath);
+
+  // Read onsets from file and a score for each onset
   std::map<double, std::vector<double>> onsetMap{};
-  for(const auto onset : onsetList)
+  ifstream txtOnsetFile;
+  txtOnsetFile.open(txtOnsetPath, ios::in);
+
+  while (!txtOnsetFile.eof())
   {
-    auto score = getScoreAtSamplePosition(onset * sampleRate, inputSignal, numSamples, sampleRate);
-    onsetMap[score].push_back(onset);
+      string line;
+      getline(txtOnsetFile, line);
+      double timeSec = strtod(line.c_str(), NULL);
+      timeSec = round(timeSec * 1000.0) / 1000.0;
+      int sampleIndex = int(timeSec * sampleRate);
+      if (timeSec != 0)
+      {
+          auto score = getScoreAtSamplePosition(sampleIndex, inputSignal, numSamples, sampleRate);
+          onsetMap[score].push_back(timeSec);
+      }
   }
 
-  // Reverse the map ie. change keys to values
+  // // Reverse the map ie. change keys to values
   const auto onsetMapCopy = onsetMap;
   std::map<double, double> onsetScoreFull{};
   for (auto it = onsetMapCopy.begin(); it != onsetMapCopy.end(); ++it)
@@ -1509,13 +1587,13 @@ ibt(mrs_string sfName, mrs_string outputTxt)
       std::cout << "(Full List) Onset at: " << it->first << " with score: " << it->second << std::endl;
   }
 
-  // Keep the N most important onset groups
-  const int N = 40;
+  // // Keep the N most important onset groups
+  const int N = 1000;
   auto eraseUntil = onsetMap.end();
   std::advance(eraseUntil, - N);
   onsetMap.erase(onsetMap.begin(), eraseUntil);
 
-  // Reverse the map ie. change keys to values
+  // // Reverse the map ie. change keys to values
   std::map<double, double> onsetScore{};
   for (auto it = onsetMap.begin(); it != onsetMap.end(); ++it)
   {
@@ -1537,6 +1615,8 @@ ibt(mrs_string sfName, mrs_string outputTxt)
   // TODO: Merge Beats & Onsets
 
   // TODO: Write to files
+
+  // Start Marker reordering based on energy content
 
   int cnt = 0;
   while (!inputTxt.eof())
